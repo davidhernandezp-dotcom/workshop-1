@@ -480,7 +480,7 @@ This single command runs the full pipeline end to end: Extract → Clean/Transfo
 Open `sql/analytical_queries.sql` in MySQL Workbench (connected to `recruitment_dw`) and run each query to reproduce the R1–R5 analytical outputs below.
 
 ### 14.7 Connect the BI tool
-Point Power BI directly at the `recruitment_dw` MySQL database via an ODBC connection (`Get Data → ODBC`, using a System DSN configured for `127.0.0.1:3306` with SSL disabled) to reproduce the visualizations. See `powerbi/recruitment_dw.pbix` for the saved report.
+Point Power BI directly at the `recruitment_dw` MySQL database via an ODBC connection (`Get Data → ODBC`, using a System DSN configured for `127.0.0.1:3306` with SSL disabled) to reproduce the visualizations. Screenshots of the resulting dashboard are included in `results/` (see section 15.1 below).
 
 ---
 
@@ -582,35 +582,35 @@ GROUP BY is_hired;
 
 ## 15.1 Power BI Dashboard
 
-The Data Warehouse was connected directly to Power BI via an ODBC System DSN (`Get Data → ODBC`, pointing at `recruitment_dw` on `127.0.0.1:3306`). The report file is available at `powerbi/recruitment_dw.pbix`.
+The Data Warehouse was connected directly to Power BI via an ODBC System DSN (`Get Data → ODBC`, pointing at `recruitment_dw` on `127.0.0.1:3306`). Screenshots of each visualization are shown below.
 
 The dashboard includes four visualizations, covering the required temporal analysis, comparative analysis, and an analysis tied to R4/R5:
 
 ### Diagram 1 — Hiring Trend Over Time (R1)
 **KPI:** `Hiring Rate = DIVIDE(SUM(fact_applications[is_hired]), COUNTROWS(fact_applications)) * 100`, plotted by year/month.
 
-![Power BI Diagram 1 — R1 Temporal Analysis](powerbi/diagrama1.png)
+![Power BI Diagram 1 — R1 Temporal Analysis](results/diagrama1.png)
 
 **Interpretation:** confirms the same finding as the R1 SQL query — the monthly hiring rate stays within a stable band across the full 2018–2022 period, with no clear upward or downward trend.
 
 ### Diagram 2 — Hiring Rate by Technology (R2)
 **KPI:** `Hiring Rate` broken down by `dim_technology[technology_name]`, sorted descending.
 
-![Power BI Diagram 2 — R2 Comparative Analysis](powerbi/diagrama2.png)
+![Power BI Diagram 2 — R2 Comparative Analysis](results/diagrama2.png)
 
 **Interpretation:** visually confirms that the highest-volume technologies (Game Development, DevOps) are not the ones with the best hiring rates — *Development - CMS Backend* leads in hire rate despite lower application volume.
 
 ### Diagram 3 — Application Volume and Hiring Rate by Country (R4)
 **KPI:** Application count and `Hiring Rate` broken down by `dim_country[country_name]`.
 
-![Power BI Diagram 3 — R4 Geographic Analysis](powerbi/diagrama3.png)
+![Power BI Diagram 3 — R4 Geographic Analysis](results/diagrama3.png)
 
 **Interpretation:** shows the even distribution of applications across the 244 countries and highlights how hiring-rate outliers correspond to countries with small sample sizes, reinforcing the caution noted in the R4 SQL interpretation.
 
 ### Diagram 4 — Assessment Score Comparison by Outcome (R5)
 **KPI:** `Avg Code Challenge = AVERAGE(fact_applications[code_challenge_score])` and `Avg Interview = AVERAGE(fact_applications[technical_interview_score])`, grouped by `is_hired`.
 
-![Power BI Diagram 4 — R5 Assessment Performance](powerbi/diagrama4.png)
+![Power BI Diagram 4 — R5 Assessment Performance](results/diagrama4.png)
 
 **Interpretation:** hired candidates (`is_hired = 1`) average close to 8.5 on both assessments, while non-hired candidates (`is_hired = 0`) average close to 4.5 on both — the two assessments move together within each group, meaning neither one disqualifies disproportionately more candidates than the other.
 
