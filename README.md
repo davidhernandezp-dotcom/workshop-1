@@ -184,11 +184,236 @@ Each module has a single responsibility, matching the folder structure under `sr
 
 - **`extract.py`** — reads the raw CSV (`;`-separated) into a Pandas DataFrame. No business transformations happen here.
 - **`transform.py`** — cleans the data (`clean()`: type casting, text standardization, duplicate/null handling) and applies the business rule and derived attributes (`apply_business_rules()`: `is_hired`, `yoe_range`).
-- **`dimensional_model.py`** — builds the 4 dimension tables with surrogate keys and the fact table, joining the prepared data against each dimension.
-- **`load.py`** — creates the `recruitment_dw` MySQL database if it doesn't exist (`ensure_database_exists()`) and loads dimensions first, then the fact table.
+- **`dimensional_model.py`** — builds the 4 dimension tables with surrogate keys and the fact table, joining the prepared data against each dimension. A row-count assertion (`assert len(fact) == len(df)`) guards against accidental row duplication or loss during the joins.
+- **`load.py`** — creates the `recruitment_dw` MySQL database if it doesn't exist (`ensure_database_exists()`), loads dimensions first and then the fact table, then applies primary/foreign key constraints (`apply_constraints()`) and validates the load (`validate_load()`: row counts per table and a check for orphan foreign keys in `fact_applications`).
 - **`main.py`** — runs the full pipeline in order and prints a final row count as a basic sanity check.
 
+The resulting schema (tables, primary keys, and foreign keys) is also documented independently in `sql/create_tables.sql`, so the Data Warehouse structure can be inspected or recreated without running the Python pipeline.
+
 This separation keeps the pipeline reproducible: each stage can be run, tested, or debugged independently, and the whole process is re-runnable end to end with a single command.
+
+### 11.1 Implementation
+
+**`extract.py`** — reads the raw CSV, no transformations:
+```python
+import pandas as pd
+
+
+def extract(path='data/raw/candidates.csv'):
+    """Lee el CSV original de candidatos."""
+    df = pd.read_csv(path, sep=';')
+    return df
+```
+
+**`transform.py`** — cleaning and business rules:
+```python
+import pandas as pd
+
+
+def clean(df):
+    """Limpia el DataFrame: nombres de columnas, tipos, duplicados y nulos."""
+    df = df.copy()
+
+    df.columns = [c.strip() for c in df.columns]
+    df['Application Date'] = pd.to_datetime(df['Application Date'], errors='coerce')
+    df['Country'] = df['Country'].str.strip().str.title()
+    df['Seniority'] = df['Seniority'].str.strip().str.title()
+    df['Technology'] = df['Technology'].str.strip()
+
+    df = df.drop_duplicates()
+    df = df.dropna(subset=['Application Date', 'Code Challenge Score', 'Technical Interview Score'])
+
+    return df
+
+
+def apply_business_rules(df):
+    """Aplica la regla de contratación y crea columnas derivadas."""
+    df = df.copy()
+
+    df['is_hired'] = (
+        (df['Code Challenge Score'] >= 7) &
+        (df['Technical Interview Score'] >= 7)
+    ).astype(int)
+
+    bins = [-1, 1, 3, 6, 100]
+    labels = ['0-1', '2-3', '4-6', '7+']
+    df['yoe_range'] = pd.cut(df['YOE'], bins=bins, labels=labels)
+
+    return df
+```
+
+**`dimensional_model.py`** — builds dimensions and the fact table with surrogate keys:
+```python
+def build_dim_date(df):
+    dates = df[['Application Date']].drop_duplicates().reset_index(drop=True)
+    dates['date_key'] = dates.index + 1
+    dates['year'] = dates['Application Date'].dt.year
+    dates['month'] = dates['Application Date'].dt.month
+    dates['month_name'] = dates['Application Date'].dt.strftime('%B')
+    dates['quarter'] = dates['Application Date'].dt.quarter
+    dates = dates.rename(columns={'Application Date': 'full_date'})
+    return dates
+
+
+def build_dim_technology(df):
+    tech = df[['Technology']].drop_duplicates().reset_index(drop=True)
+    tech['technology_key'] = tech.index + 1
+    tech = tech.rename(columns={'Technology': 'technology_name'})
+    return tech
+
+
+def build_dim_country(df):
+    country = df[['Country']].drop_duplicates().reset_index(drop=True)
+    country['country_key'] = country.index + 1
+    country = country.rename(columns={'Country': 'country_name'})
+    return country
+
+
+def build_dim_profile(df):
+    profile = df[['Seniority', 'yoe_range']].drop_duplicates().reset_index(drop=True)
+    profile['profile_key'] = profile.index + 1
+    return profile
+
+
+def build_fact(df, dim_date, dim_tech, dim_country, dim_profile):
+    fact = df.merge(dim_date, left_on='Application Date', right_on='full_date')
+    fact = fact.merge(dim_tech, left_on='Technology', right_on='technology_name')
+    fact = fact.merge(dim_country, left_on='Country', right_on='country_name')
+    fact = fact.merge(dim_profile, on=['Seniority', 'yoe_range'])
+
+    assert len(fact) == len(df), "Error de integridad: el merge duplicó o perdió filas"
+
+    fact = fact[[
+        'date_key', 'technology_key', 'country_key', 'profile_key',
+        'Code Challenge Score', 'Technical Interview Score', 'is_hired'
+    ]].reset_index(drop=True)
+
+    fact = fact.rename(columns={
+        'Code Challenge Score': 'code_challenge_score',
+        'Technical Interview Score': 'technical_interview_score'
+    })
+
+    fact['application_key'] = fact.index + 1
+    return fact
+```
+
+**`load.py`** — creates the database, loads tables, and adds constraints:
+```python
+from sqlalchemy import create_engine, text
+
+DB_USER = 'root'
+DB_PASSWORD = 'root'
+DB_HOST = 'localhost'
+DB_PORT = '3306'
+DB_NAME = 'recruitment_dw'
+
+
+def get_engine(with_db=True):
+    db_part = f'/{DB_NAME}' if with_db else ''
+    url = f'mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}{db_part}'
+    return create_engine(url)
+
+
+def ensure_database_exists():
+    engine = get_engine(with_db=False)
+    with engine.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE IF NOT EXISTS {DB_NAME}'))
+        conn.commit()
+
+
+def apply_constraints(engine):
+    """Agrega llaves primarias y foráneas después de cargar los datos."""
+    ddl = [
+        "ALTER TABLE dim_date ADD PRIMARY KEY (date_key)",
+        "ALTER TABLE dim_technology ADD PRIMARY KEY (technology_key)",
+        "ALTER TABLE dim_country ADD PRIMARY KEY (country_key)",
+        "ALTER TABLE dim_candidate_profile ADD PRIMARY KEY (profile_key)",
+        "ALTER TABLE fact_applications ADD PRIMARY KEY (application_key)",
+        "ALTER TABLE fact_applications ADD CONSTRAINT fk_date "
+        "FOREIGN KEY (date_key) REFERENCES dim_date(date_key)",
+        "ALTER TABLE fact_applications ADD CONSTRAINT fk_tech "
+        "FOREIGN KEY (technology_key) REFERENCES dim_technology(technology_key)",
+        "ALTER TABLE fact_applications ADD CONSTRAINT fk_country "
+        "FOREIGN KEY (country_key) REFERENCES dim_country(country_key)",
+        "ALTER TABLE fact_applications ADD CONSTRAINT fk_profile "
+        "FOREIGN KEY (profile_key) REFERENCES dim_candidate_profile(profile_key)",
+    ]
+    with engine.connect() as conn:
+        for stmt in ddl:
+            conn.execute(text(stmt))
+        conn.commit()
+
+
+def validate_load(engine):
+    """Verifica conteo de filas y ausencia de referencias huérfanas."""
+    with engine.connect() as conn:
+        checks = {
+            'date_key': 'dim_date', 'technology_key': 'dim_technology',
+            'country_key': 'dim_country', 'profile_key': 'dim_candidate_profile',
+        }
+        for fk_col, dim_table in checks.items():
+            orphans = conn.execute(text(f"""
+                SELECT COUNT(*) FROM fact_applications f
+                LEFT JOIN {dim_table} d ON f.{fk_col} = d.{fk_col}
+                WHERE d.{fk_col} IS NULL
+            """)).scalar()
+            if orphans > 0:
+                raise ValueError(f'{orphans} referencias inválidas en {fk_col}')
+    print('Validación completa: sin referencias huérfanas.')
+
+
+def load(dim_date, dim_tech, dim_country, dim_profile, fact):
+    ensure_database_exists()
+    engine = get_engine()
+
+    dim_date.to_sql('dim_date', engine, if_exists='replace', index=False)
+    dim_tech.to_sql('dim_technology', engine, if_exists='replace', index=False)
+    dim_country.to_sql('dim_country', engine, if_exists='replace', index=False)
+    dim_profile.to_sql('dim_candidate_profile', engine, if_exists='replace', index=False)
+    fact.to_sql('fact_applications', engine, if_exists='replace', index=False)
+
+    apply_constraints(engine)
+    validate_load(engine)
+    print(f'Base de datos "{DB_NAME}" creada/actualizada en MySQL.')
+```
+
+**`main.py`** — orchestrates the full pipeline:
+```python
+import os
+from extract import extract
+from transform import clean, apply_business_rules
+from dimensional_model import (
+    build_dim_date, build_dim_technology, build_dim_country,
+    build_dim_profile, build_fact
+)
+from load import load
+
+
+def run():
+    raw = extract()
+    cleaned = clean(raw)
+    enriched = apply_business_rules(cleaned)
+
+    dim_date = build_dim_date(enriched)
+    dim_tech = build_dim_technology(enriched)
+    dim_country = build_dim_country(enriched)
+    dim_profile = build_dim_profile(enriched)
+    fact = build_fact(enriched, dim_date, dim_tech, dim_country, dim_profile)
+
+    os.makedirs('data/processed', exist_ok=True)
+    dim_date.to_csv('data/processed/dim_date.csv', index=False)
+    dim_tech.to_csv('data/processed/dim_technology.csv', index=False)
+    dim_country.to_csv('data/processed/dim_country.csv', index=False)
+    dim_profile.to_csv('data/processed/dim_candidate_profile.csv', index=False)
+    fact.to_csv('data/processed/fact_applications.csv', index=False)
+
+    load(dim_date, dim_tech, dim_country, dim_profile, fact)
+    print('Pipeline completo. Filas en fact_applications:', len(fact))
+
+
+if __name__ == '__main__':
+    run()
+```
 
 ---
 
@@ -199,12 +424,15 @@ Decisions applied in `transform.py`, and why:
 | Decision | Reasoning |
 |---|---|
 | `Application Date` cast to `datetime` | Required to build `dim_date` and to group by year/month/quarter for R1. |
-| Text columns (`Country`, `Seniority`, `Technology`) stripped of whitespace and standardized casing | Prevents accidental duplicate dimension members (e.g., `"Spain"` vs `"spain "` becoming two different `dim_country` rows). |
+| `Country` and `Seniority` stripped of whitespace and standardized to title case | Prevents accidental duplicate dimension members (e.g., `"Spain"` vs `"spain "` becoming two different `dim_country` rows). |
+| `Technology` stripped of whitespace only (casing left as-is) | Profiling confirmed the 24 technology values already come consistently capitalized in the source file. Applying title case here would distort names that don't follow standard capitalization rules (e.g., `"QA Manual"` → `"Qa Manual"`, `"DevOps"` → `"Devops"`), so only whitespace is trimmed to avoid introducing errors while still preventing accidental duplicates from stray spaces. |
 | Duplicate rows dropped | Defensive step — profiling found 0 duplicates in the current file, but the pipeline still checks so it stays correct if the source file is refreshed later. |
 | Rows with missing `Application Date`, `Code Challenge Score`, or `Technical Interview Score` dropped | These three fields are required to compute the grain and the business rule; profiling confirmed there were none to drop in the current file. |
 | `is_hired` computed as `(Code Challenge Score >= 7) AND (Technical Interview Score >= 7)` | Exact business rule required by the assignment. Stored as 0/1 so it works both as a filter and as an additive measure (`SUM(is_hired)` = total hires). |
 | `YOE` bucketed into ranges (`0-1`, `2-3`, `4-6`, `7+`) as `yoe_range` | Needed to build `dim_candidate_profile` and answer R3 at a readable grain, instead of grouping by 31 individual YOE values. |
 | No additional derived columns created | R4 and R5 are fully answerable with existing attributes (`Country`, both scores, `is_hired`) — extra columns were avoided to follow the assignment's instruction not to transform data without analytical purpose. |
+| Primary/foreign key constraints applied after loading (`load.py`) | `pandas.to_sql()` only creates columns and infers types — it does not create constraints. `apply_constraints()` explicitly adds `PRIMARY KEY` on every surrogate key and `FOREIGN KEY` references from `fact_applications` to each dimension, so referential integrity is enforced at the database level, not just assumed from the ETL logic. |
+| Post-load validation (`load.py`) | `validate_load()` checks row counts per table and confirms there are zero orphan foreign keys in `fact_applications` (i.e., every `date_key`, `technology_key`, `country_key`, and `profile_key` in the fact table matches a real row in its dimension). The pipeline raises an error and stops if any orphan is found, instead of silently loading bad data. |
 
 ---
 
@@ -218,7 +446,7 @@ Decisions applied in `transform.py`, and why:
 | Data Warehouse | **MySQL 8** |
 | DB driver (Python) | PyMySQL (via SQLAlchemy) |
 | Version control | Git + GitHub |
-| BI Visualization | Power BI (connected directly to MySQL) |
+| BI Visualization | Power BI (connected directly to MySQL via ODBC) |
 
 ---
 
@@ -246,19 +474,19 @@ Open `notebooks/data_profiling.ipynb` in VS Code and run all cells.
 ```bash
 python src/main.py
 ```
-This single command runs the full pipeline end to end: Extract → Clean/Transform → Business Rules → Dimensional Modeling → **create the `recruitment_dw` database if it doesn't exist** → Load dimensions → Load fact table. It can be re-run safely at any time — it replaces the tables instead of duplicating rows.
+This single command runs the full pipeline end to end: Extract → Clean/Transform → Business Rules → Dimensional Modeling → **create the `recruitment_dw` database if it doesn't exist** → Load dimensions → Load fact table → apply primary/foreign key constraints → validate referential integrity. It can be re-run safely at any time — it replaces the tables instead of duplicating rows.
 
 ### 14.6 Run the analytical queries
 Open `sql/analytical_queries.sql` in MySQL Workbench (connected to `recruitment_dw`) and run each query to reproduce the R1–R5 analytical outputs below.
 
 ### 14.7 Connect the BI tool
-Point Power BI directly at the `recruitment_dw` MySQL database (`Get Data → MySQL Database`) to reproduce the visualizations.
+Point Power BI directly at the `recruitment_dw` MySQL database via an ODBC connection (`Get Data → ODBC`, using a System DSN configured for `127.0.0.1:3306` with SSL disabled) to reproduce the visualizations. See `powerbi/recruitment_dw.pbix` for the saved report.
 
 ---
 
 ## 15. Analytical Queries and KPIs
 
-All results below were generated directly from the Data Warehouse (`fact_applications` joined with its dimensions), using the queries in `sql/analytical_queries.sql`.
+All results below were generated directly from the Data Warehouse (`fact_applications` joined with its dimensions), using the queries in `sql/analytical_queries.sql`. Each query is followed by a screenshot of the actual result set produced in MySQL Workbench.
 
 ### R1 — Hiring Trends
 **Business question:** How have hiring outcomes changed over time?
@@ -271,6 +499,9 @@ JOIN dim_date d ON f.date_key = d.date_key
 GROUP BY d.year, d.month
 ORDER BY d.year, d.month;
 ```
+
+![R1 Query Result](results/r1_hiring_trends.png)
+
 **Result (monthly hiring rate, 2018–2022):** the rate fluctuates consistently between ~11.4% and ~15.7% across all 55 months, with no sustained upward or downward trend.
 
 **Interpretation:** hiring outcomes are stable year over year. This suggests the hiring outcome is driven by candidate performance on the two assessments rather than by seasonal or year-over-year shifts in recruitment strategy.
@@ -286,6 +517,9 @@ JOIN dim_technology t ON f.technology_key = t.technology_key
 GROUP BY t.technology_name
 ORDER BY hiring_rate DESC;
 ```
+
+![R2 Query Result](results/r2_technology_analysis.png)
+
 **Result (top / bottom):** *Development - CMS Backend* has the highest hiring rate (15.09%); *Social Media Community Management* has the lowest (11.69%). *Game Development* and *DevOps* receive by far the most applications (3,818 and 3,808 — roughly double any other technology) but only mid-range hiring rates (13.59% and 13.00%).
 
 **Interpretation:** application volume and hiring quality are not correlated — the most popular technologies are not the ones with the best outcomes, which matters for where sourcing budget should actually go.
@@ -299,6 +533,9 @@ FROM fact_applications f
 JOIN dim_candidate_profile p ON f.profile_key = p.profile_key
 GROUP BY p.seniority, p.yoe_range;
 ```
+
+![R3 Query Result](results/r3_candidate_profile.png)
+
 **Result:** hiring rate stays close to the ~13% overall average across almost every seniority/experience combination. The clearest outliers are *Intern* candidates with 0-1 years of experience (highest observed rate, 19.42%) and *Mid-Level* candidates with 2-3 years (lowest, 10.41%).
 
 **Interpretation:** seniority and years of experience, on their own, are weak predictors of hiring outcome in this dataset — the technical assessments appear to be the real gatekeepers, not the candidate's declared background.
@@ -313,6 +550,9 @@ JOIN dim_country c ON f.country_key = c.country_key
 GROUP BY c.country_name
 ORDER BY applications DESC;
 ```
+
+![R4 Query Result](results/r4_geographic_analysis.png)
+
 **Result:** applications are spread almost evenly across 244 countries (roughly 150–250 each; the top country, Malawi, has only 242). Hiring rate ranges from ~7.6% (Saint Vincent and the Grenadines, Guam, Montenegro) up to ~22.6% (Northern Mariana Islands).
 
 **Interpretation:** no country dominates recruitment volume, so there is no natural "top market." The wide spread in hiring rate is largely explained by the small per-country sample size (~150–250 applications) rather than a genuine geographic effect, which is an important caveat before using this data to justify country-level sourcing decisions.
@@ -326,6 +566,9 @@ SELECT is_hired,
 FROM fact_applications
 GROUP BY is_hired;
 ```
+
+![R5 Query Result](results/r5_assessment_performance.png)
+
 **Result:**
 
 | Outcome | Avg Code Challenge | Avg Technical Interview |
@@ -334,6 +577,42 @@ GROUP BY is_hired;
 | HIRED | 8.50 | 8.48 |
 
 **Interpretation:** hired candidates score about 4 points higher on both assessments, and the two scores stay close to each other within each group — indicating the two assessments move together and both contribute meaningfully to the hiring outcome, consistent with the business rule requiring both scores ≥ 7.
+
+---
+
+## 15.1 Power BI Dashboard
+
+The Data Warehouse was connected directly to Power BI via an ODBC System DSN (`Get Data → ODBC`, pointing at `recruitment_dw` on `127.0.0.1:3306`). The report file is available at `powerbi/recruitment_dw.pbix`.
+
+The dashboard includes four visualizations, covering the required temporal analysis, comparative analysis, and an analysis tied to R4/R5:
+
+### Diagram 1 — Hiring Trend Over Time (R1)
+**KPI:** `Hiring Rate = DIVIDE(SUM(fact_applications[is_hired]), COUNTROWS(fact_applications)) * 100`, plotted by year/month.
+
+![Power BI Diagram 1 — R1 Temporal Analysis](powerbi/diagrama1.png)
+
+**Interpretation:** confirms the same finding as the R1 SQL query — the monthly hiring rate stays within a stable band across the full 2018–2022 period, with no clear upward or downward trend.
+
+### Diagram 2 — Hiring Rate by Technology (R2)
+**KPI:** `Hiring Rate` broken down by `dim_technology[technology_name]`, sorted descending.
+
+![Power BI Diagram 2 — R2 Comparative Analysis](powerbi/diagrama2.png)
+
+**Interpretation:** visually confirms that the highest-volume technologies (Game Development, DevOps) are not the ones with the best hiring rates — *Development - CMS Backend* leads in hire rate despite lower application volume.
+
+### Diagram 3 — Application Volume and Hiring Rate by Country (R4)
+**KPI:** Application count and `Hiring Rate` broken down by `dim_country[country_name]`.
+
+![Power BI Diagram 3 — R4 Geographic Analysis](powerbi/diagrama3.png)
+
+**Interpretation:** shows the even distribution of applications across the 244 countries and highlights how hiring-rate outliers correspond to countries with small sample sizes, reinforcing the caution noted in the R4 SQL interpretation.
+
+### Diagram 4 — Assessment Score Comparison by Outcome (R5)
+**KPI:** `Avg Code Challenge = AVERAGE(fact_applications[code_challenge_score])` and `Avg Interview = AVERAGE(fact_applications[technical_interview_score])`, grouped by `is_hired`.
+
+![Power BI Diagram 4 — R5 Assessment Performance](powerbi/diagrama4.png)
+
+**Interpretation:** hired candidates (`is_hired = 1`) average close to 8.5 on both assessments, while non-hired candidates (`is_hired = 0`) average close to 4.5 on both — the two assessments move together within each group, meaning neither one disqualifies disproportionately more candidates than the other.
 
 ---
 
